@@ -321,11 +321,12 @@ service; both are named so the failure mode is recognizable.
   above would pack to nothing and this service would ask for "any `pow:ergo` peer"
   instead of the one it declares. **`nodo pack .` against a tree without that PR produces
   a spec with an empty `formal`.**
-- **The `pow:ergo` resolver emitting P2P uris** — a separate nodo PR, in flight. A peer
-  is *verified* over its REST API (`:9053`) and has to be *dialled* over Ergo's P2P port
-  (`:9030` on mainnet, `:9023` on testnet), and `resolve_pow_network` currently builds
-  each `Instance.Uri` from the URL it verified. Until that lands, the addresses reaching
-  `knownPeers` carry the REST port, and the node will not complete a handshake with them.
+- **[nodo#384](https://github.com/celaut-project/nodo/pull/384)** — the `pow:ergo`
+  resolver emits each peer's P2P endpoint. A peer is *verified* over its REST API
+  (`:9053`) and has to be *dialled* over Ergo's P2P port (`:9030` on mainnet, `:9023` on
+  testnet), and before that PR `resolve_pow_network` built each `Instance.Uri` from the
+  URL it verified. Without it, the addresses reaching `knownPeers` carry the REST port,
+  and the node will not complete a handshake with them.
   The entrypoint writes whatever it is given — the port comes from the resolution, and
   translating it here would be this service second-guessing the resolver.
 
