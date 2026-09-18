@@ -18,7 +18,7 @@ something the operator runs.
 
 The interesting part is not the jar — it is **how it finds peers**.
 
-## The `pow:ergo` network
+## The network it asks for
 
 An Ergo node needs a list of peers to dial. Every other packaging of one solves that by
 hardcoding a list: Ergo's own `mainnet.conf` ships thirteen addresses, and every Docker
@@ -32,62 +32,124 @@ This service declares a network instead. `.service/service.json`:
     "tags": ["pow:ergo"],
     "formal": {
         "pow.chain": "ergo",
-        "pow.block_id": "a7439dad316fc1f387871b9839660b3ad3ada657e6cb0a9a28d807b78346aba9",
-        "pow.min_cumulative_difficulty": "2749641828372274216960",
-        "pow.min_height": "1870000",
+        "pow.consensus": "autolykos-v2",
+        "pow.target_block_time_s": "120",
+        "ledger.model": "extended-utxo",
+        "ledger.scripting": "ergoscript-sigma",
+        "ledger.emission": "finite-linear-reduction",
+        "ledger.native_asset": "ERG",
+        "ledger.token_standard": "eip-4",
+
+        "pow.block_id": "${ERGO_BLOCK_ID}",
+        "pow.min_cumulative_difficulty": "${ERGO_MIN_CUMULATIVE_DIFFICULTY}",
+        "pow.min_height": "${ERGO_MIN_HEIGHT}",
         "pow.max_tip_age_s": "3600"
     }
 }
 ```
 
-That is not a list of hosts. It is a **property**: *a peer whose main chain contains this
-block, behind which at least this much cumulative work has been done, whose tip is not
-more than an hour stale.* The node running this instance is what turns the property into
-addresses — it verifies candidates against exactly those conditions
-(`src/manager/pow_networks.py`) and writes the survivors into this instance's
-`__config__`, as the `ConfigurationFile.NetworkResolution` whose tags contain `pow:ergo`.
+That is not a list of hosts, and the blank line in it is the whole design. The keys
+above it say **what Ergo is**; the keys below it say **which Ergo network to join**, and
+this file does not answer that second question.
 
-`service/entrypoint.sh` reads them out of there and writes every one into
-`scorex.network.knownPeers` before starting the jar. **No address is hardcoded anywhere
-in this repository.**
+### Above the line: what Ergo is
 
-Three details of that declaration are deliberate:
+These are fixed by this service and no instantiation may change them. Each one is a
+property that distinguishes Ergo from Bitcoin, or from a plain peer-to-peer protocol
+like BitTorrent, and each is sourced from nodo's own description of the chain in
+[`src/payment_system/contracts/ergo/interface.py`](https://github.com/celaut-project/nodo/blob/dev/src/payment_system/contracts/ergo/interface.py)
+— the informal PROSE that
+[nodo#385](https://github.com/celaut-project/nodo/issues/385) asked for a more formal
+version of:
 
-**The block is a real one, at a round height.** Height 1870000, id
-`a7439dad…46aba9`, fetched from a mainnet node:
+| key | value | what it says | where it comes from |
+|---|---|---|---|
+| `pow.chain` | `ergo` | The chain. The one key that can never be templated — it must agree with the `pow:ergo` tag the operator's `service_networks` policy vetted. | `interface.py:59` (`LEDGER = "ergo"`) |
+| `pow.consensus` | `autolykos-v2` | The mining puzzle. Not SHA-256d: Autolykos is memory-hard and was designed to be ASIC-resistant and pool-resistant, which is a different security story from Bitcoin's. | `interface.py:50-55` PROSE, *"PoW blockchain using Autolykos"*; v2 is the version live on mainnet since the v5.0 hard fork |
+| `pow.target_block_time_s` | `120` | One block every two minutes. | `src/payment_system/contracts/ergo/donation_scan.py:25-29` — *"Ergo's target block time… `SECONDS_PER_BLOCK = 120`"*, with the comment "it is a property of the chain" |
+| `ledger.model` | `extended-utxo` | Boxes carrying a value, a guarding script and typed registers, spent whole and replaced — not accounts with mutable balances. Bitcoin is UTXO but not *extended*: it has no registers and no typed data on an output. | `interface.py:51` PROSE, *"verifiable eUTXO model"* |
+| `ledger.scripting` | `ergoscript-sigma` | Guarding scripts are ErgoScript compiled to Sigma propositions — statements in sigma protocols, deliberately **non-Turing-complete**, so the cost of verifying a spend is knowable before running it. | `interface.py:52` PROSE, *"non-Turing-complete Sigma scripts"*; the raw form is visible as `propositionBytes` in `src/payment_system/contracts/ergo/ergo_tree.py` |
+| `ledger.emission` | `finite-linear-reduction` | A capped supply whose per-block emission steps down linearly — not Bitcoin's halvings. | `interface.py:52-53` PROSE, *"finite emission with linear reduction"* |
+| `ledger.native_asset` | `ERG` | What the chain's own unit is called. | `interface.py:69` (`NATIVE_ASSET = "ERG"`) |
+| `ledger.token_standard` | `eip-4` | Other assets ride in the **same boxes** as ERG rather than in separate token contracts — which is why one Ergo address is paid in ERG and in every token at once. | `src/payment_system/contracts/envs.py:15`, *"the same script paid in ERG and in every EIP-4 token at the same address"* |
+
+**On the key vocabulary.** Two prefixes, and the split is not decorative. `pow.` is the
+vocabulary nodo's `src/manager/pow_networks.py` already defines and *interprets*;
+`ledger.` is a neighbouring vocabulary this file introduces and **nobody enforces** —
+nodo preserves and round-trips keys outside the one it reads
+([`NETWORKS.md`](https://github.com/celaut-project/nodo/blob/dev/docs/NETWORKS.md)), and
+that is deliberate: none of these five is checkable from an Ergo node's REST API, so a
+resolver that pretended to verify them would be lying. What they are for is *identity* —
+they are compared byte for byte by `match_networks`, so a network declaring a different
+ledger model is a different domain even under the same tag. The set is kept small on
+purpose: every key here is one more thing that must be true of any future Ergo, and a
+vocabulary that describes the chain in thirty keys is one that breaks on the next hard
+fork.
+
+### Below the line: which Ergo network
+
+`pow.block_id`, `pow.min_cumulative_difficulty` and `pow.min_height` say *which concrete
+chain state* to join. **Mainnet, testnet and a private low-difficulty chain are all Ergo
+by every key above** and are told apart only by these three — so hardcoding them, which
+this file used to do, was this service choosing a chain on its instantiator's behalf.
+That is the motivating problem in
+[nodo#385](https://github.com/celaut-project/nodo/issues/385): an instance can otherwise
+end up peered to an unrelated Ergo-compatible chain that nobody asked for.
+
+So they are templates, and the instantiator fills them in:
+
+| variable | what to put in it |
+|---|---|
+| `ERGO_BLOCK_ID` | A block id that is on the main chain of the network you mean. Peers are required to have it on **their** main chain, not merely to have stored it. |
+| `ERGO_MIN_CUMULATIVE_DIFFICULTY` | The cumulative work (`/info` → `fullBlocksScore`) the chain had reached **at that block** — not at the current tip. Using the tip's figure makes the ask silently stricter every time the value is written, and a requirement whose meaning depends on when it was authored is one nobody can read. Written as a decimal string: Ergo's score passed 2⁶⁴ long ago. |
+| `ERGO_MIN_HEIGHT` | That block's height. It restates the same fact in a form the resolver can check from `/info` alone, before spending two more requests on the block itself. |
+
+A worked example for mainnet, which is what this file used to hardcode — the values are
+*examples*, not defaults, and there is nothing in the service that supplies them:
 
 ```sh
+# A real block at a round height:
 curl -s https://node.sigmaspace.io/blocks/at/1870000
 # ["a7439dad316fc1f387871b9839660b3ad3ada657e6cb0a9a28d807b78346aba9"]
-```
 
-**The work figure is the chain's score *at that block*, not at the current tip.** This is
-the part worth reading twice. `/info` reports `fullBlocksScore` for whatever height the
-peer is at now; putting *that* number in the spec would mean the ask silently got
-stricter every time the file was written, and a spec whose meaning depends on when it was
-authored is one nobody can read. So the figure here is the cumulative work up to height
-1870000, derived by subtracting every block after it from a tip score:
-
-```sh
-# tip, at the time this was computed
+# The chain's score AT that block, derived by subtracting every block after it
+# from a tip score:
 curl -s https://node.sigmaspace.io/info
 #   "fullHeight" : 1875916
 #   "fullBlocksScore" : 2750033340952676925440
-# every difficulty from 1870001 to 1875916, in 512-block slices:
 curl -s "https://node.sigmaspace.io/blocks/chainSlice?fromHeight=H&toHeight=H2" | jq -r '.[].difficulty'
-# sum = 391512580402708480  (5916 blocks, checked for gaps and duplicates)
+# sum over 1870001..1875916 = 391512580402708480  (5916 blocks, no gaps, no duplicates)
 # 2750033340952676925440 - 391512580402708480 = 2749641828372274216960
 ```
 
-Which means the ask reads as *"a peer that has at least caught up to the block I named"*
-and stays exactly as strict next year as it is today. `pow.min_height` restates the same
-fact in a form the resolver can check from `/info` alone, before it spends two more
-requests on the block itself.
+```yaml
+ERGO_BLOCK_ID: "a7439dad316fc1f387871b9839660b3ad3ada657e6cb0a9a28d807b78346aba9"
+ERGO_MIN_CUMULATIVE_DIFFICULTY: "2749641828372274216960"
+ERGO_MIN_HEIGHT: "1870000"
+```
 
-**`pow.max_tip_age_s` is what keeps that from decaying.** A pinned block gets easier to
-satisfy as the chain grows — every node passes it eventually. An hour's tip age is the
-condition that still means something in 2030: a peer stalled an hour behind is no use for
-bootstrapping, whatever it once verified.
+**`pow.max_tip_age_s` is deliberately NOT templated.** It selects no chain: every Ergo
+network produces blocks on the same 120-second target, so a peer stalled an hour behind
+is useless for bootstrapping whichever one it is on. What it does is keep a pinned block
+from decaying into a weaker and weaker ask as the chain grows past it — every node passes
+a 2024 block eventually, and an hour's tip age is the condition that still means
+something in 2030. Templating it would have handed an instantiator a knob whose only
+use is to make the ask worse.
+
+### What happens when they are not set
+
+**The launch proceeds normally and the node starts with `knownPeers = []`.** With
+[nodo#385](https://github.com/celaut-project/nodo/issues/385) the resolution policy is
+per network and driven by whether its templates are answered:
+
+| | |
+|---|---|
+| all three set | The node substitutes them, resolves `pow:ergo` at launch — verifying each candidate against exactly those conditions (`src/manager/pow_networks.py`) — and writes the survivors into this instance's `__config__`. `service/entrypoint.sh` reads every `peer_instances[].uri_slot[].uri` out of it into `scorex.network.knownPeers`. |
+| any of them unset | The node **defers** this network: it resolves nothing, omits the entry from `__config__`, logs which variables were missing, and **does not fail the launch**. The entrypoint's existing empty-resolution path takes over — `knownPeers = []`, said out loud in the log, node up on its REST API. It can be resolved later over `Gateway.ResolveNetwork`. |
+
+A deferred network is not an error and not a fallback to a hardcoded list. **No address
+is hardcoded anywhere in this repository**, which is why an unresolved network means no
+peers rather than Ergo's thirteen.
 
 **There is no `*` egress.** A Bitcoin node needs it, because it discovers peers through
 DNS seeds and then dials whatever they hand back, so the set cannot be enumerated in
@@ -113,6 +175,27 @@ rule the node writes is for those peers and nothing else.
 
 The REST API is on **9053 on both networks**, so whatever launches this has one endpoint
 to talk to and does not have to know which chain it asked for.
+
+### The three the *node* reads, not the service
+
+| variable | | what it is |
+|---|---|---|
+| `ERGO_BLOCK_ID` | see below | A block on the main chain of the Ergo network you mean. |
+| `ERGO_MIN_CUMULATIVE_DIFFICULTY` | see below | The chain's cumulative work at that block, as a decimal string. |
+| `ERGO_MIN_HEIGHT` | see below | That block's height. |
+
+These are **not read by `service/entrypoint.sh`** and nothing inside the container ever
+sees them used. They are declared in `envs` so a launcher knows to supply them, and they
+are consumed by the **nodo that launches this instance**: it substitutes them into the
+`pow:ergo` network's `formal` before resolving it
+([nodo#385](https://github.com/celaut-project/nodo/issues/385)). The entrypoint's job is
+unchanged — it reads whatever peers ended up in `__config__`.
+
+They are therefore **not required, and have no defaults**. Leave any of them unset and
+the network is *deferred*: the node resolves nothing for it, the launch succeeds, and
+this service starts with `knownPeers = []`. Set all three and it starts peered. See
+[The network it asks for](#the-network-it-asks-for) for what to put in them and why
+this file does not decide it for you.
 
 ## The wallet
 
@@ -329,6 +412,16 @@ service; both are named so the failure mode is recognizable.
   and the node will not complete a handshake with them.
   The entrypoint writes whatever it is given — the port comes from the resolution, and
   translating it here would be this service second-guessing the resolver.
+- **[nodo#386](https://github.com/celaut-project/nodo/pull/386)** (implements
+  [nodo#385](https://github.com/celaut-project/nodo/issues/385)) — `${VAR}` templates in
+  `network[].formal`, substituted at launch from the launcher's environment, with a
+  network whose variables are unanswered *deferred* rather than resolved. **This is a
+  hard dependency of the `service.json` in this repository as it now stands.** Against a
+  nodo without it, `parse_pow_formal` refuses `pow.block_id=${ERGO_BLOCK_ID}` as
+  non-hexadecimal and **`nodo pack .` fails outright** — the templated spec does not
+  pack at all, rather than packing and misbehaving. A node that has the packer half but
+  not the launch half would pack it and then fail to resolve it, which is why the two
+  landed together.
 
 ## What is not here
 
